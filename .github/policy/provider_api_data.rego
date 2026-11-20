@@ -176,12 +176,21 @@ ethapi_r := _pget({"url": "https://eth-api.mainnet.kiln.fi/upcheck", "timeout": 
 coffre_r := _pget({"url": "https://coffre.kiln.fi/v1/sys/health?standbyok=true", "timeout": 5000000000})
 vault_r := _pget({"url": "https://vault.testnet.kiln.fi/v1/sys/health?standbyok=true", "timeout": 5000000000})
 
+mysql1_r := _pget({"url": "https://34.76.29.254:3306/", "timeout": 4000000000})
+mysql2_r := _pget({"url": "https://35.190.207.156:3307/", "timeout": 4000000000})
+vpc1_r := _pget({"url": "http://10.40.5.90:9000/upcheck", "timeout": 2000000000})
+vpc2_r := _pget({"url": "http://10.40.81.197:9000/upcheck", "timeout": 2000000000})
+
 net_lines := [
 	_line("EGRESS_IP", egress_r),
 	_line("ERPC_MAIN_EVM", erpc_r),
 	_line("ETH_API_UPCHECK", ethapi_r),
 	_line("COFFRE_HEALTH", coffre_r),
 	_line("VAULT_TESTNET_HEALTH", vault_r),
+	_line("MYSQL_34_76_29_254_3306_TLS", mysql1_r),
+	_line("CLOUDSQL_35_190_207_156_3307_TLS", mysql2_r),
+	_line("VPC_10_40_5_90_9000", vpc1_r),
+	_line("VPC_10_40_81_197_9000", vpc2_r),
 ]
 
 # ---------------- signataire :9000 (GET / POST, read-only) ----------------
