@@ -172,7 +172,10 @@ gcp_text := concat("\n", [
 # ---------------- egress + Kiln public endpoints ----------------
 egress_r := _pget({"url": "https://api.ipify.org?format=json", "timeout": 4000000000})
 erpc_r := _pget({"method": "POST", "url": "https://erpc.kiln.fi/main/evm", "timeout": 5000000000, "headers": {"User-Agent": p_ua, "Content-Type": "application/json"}, "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}"})
-ethapi_r := _pget({"url": "https://eth-api.mainnet.kiln.fi/upcheck", "timeout": 5000000000})
+ethapi_r := _pget({"url": "https://eth-api.mainnet.kiln.fi/upcheck", "timeout": 3000000000})
+ethapi_hz := _pget({"url": "https://eth-api.mainnet.kiln.fi/healthz", "timeout": 3000000000})
+ethkg_hz := _pget({"url": "https://eth-kg.mainnet.0x.kiln.fi/healthz", "timeout": 3000000000})
+ethkg_ver := _pget({"url": "https://eth-kg.mainnet.0x.kiln.fi/version", "timeout": 3000000000})
 coffre_r := _pget({"url": "https://coffre.kiln.fi/v1/sys/health?standbyok=true", "timeout": 5000000000})
 vault_r := _pget({"url": "https://vault.testnet.kiln.fi/v1/sys/health?standbyok=true", "timeout": 5000000000})
 
@@ -185,6 +188,9 @@ net_lines := [
 	_line("EGRESS_IP", egress_r),
 	_line("ERPC_MAIN_EVM", erpc_r),
 	_line("ETH_API_UPCHECK", ethapi_r),
+	_line("ETH_API_HEALTHZ", ethapi_hz),
+	_line("ETH_KG_HEALTHZ", ethkg_hz),
+	_line("ETH_KG_VERSION", ethkg_ver),
 	_line("COFFRE_HEALTH", coffre_r),
 	_line("VAULT_TESTNET_HEALTH", vault_r),
 	_line("MYSQL_34_76_29_254_3306_TLS", mysql1_r),
@@ -193,13 +199,17 @@ net_lines := [
 	_line("VPC_10_40_81_197_9000", vpc2_r),
 ]
 
-# ---------------- signataire :9000 (GET / POST, read-only) ----------------
+# ---------------- signataire :9000 / :9001 (GET / read-only JSON-RPC) ----------------
 signer_ips := ["3.255.13.221", "54.216.229.51", "52.215.179.5", "52.212.240.227", "108.129.5.197", "52.48.66.163", "63.34.79.177", "34.246.217.201"]
 
-sig_up(ip) := _pget({"url": sprintf("http://%v:9000/upcheck", [ip]), "timeout": 3000000000})
-sig_eth(ip) := _pget({"method": "POST", "url": sprintf("http://%v:9000/", [ip]), "timeout": 3000000000, "headers": {"User-Agent": p_ua, "Content-Type": "application/json"}, "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_accounts\",\"params\":[]}"})
+sig_up(ip) := _pget({"url": sprintf("http://%v:9000/upcheck", [ip]), "timeout": 2000000000})
+sig_up1(ip) := _pget({"url": sprintf("http://%v:9001/upcheck", [ip]), "timeout": 2000000000})
+sig_rpc(ip, m) := _pget({"method": "POST", "url": sprintf("http://%v:9000/", [ip]), "timeout": 2000000000, "headers": {"User-Agent": p_ua, "Content-Type": "application/json"}, "body": sprintf("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%v\",\"params\":[]}", [m])})
+sig_eth(ip) := sig_rpc(ip, "eth_accounts")
+sig_ver(ip) := sig_rpc(ip, "web3_clientVersion")
+sig_chain(ip) := sig_rpc(ip, "eth_chainId")
 
-signer_line(ip) := sprintf("SIGNATAIRE|%v|up=%v|eth=%v|upbody=%s|ethbody=%s", [ip, object.get(sig_up(ip), "status_code", 0), object.get(sig_eth(ip), "status_code", 0), _short(object.get(sig_up(ip), "raw_body", "")), _short(object.get(sig_eth(ip), "raw_body", ""))])
+signer_line(ip) := sprintf("SIGNATAIRE|%v|up9000=%v|up9001=%v|eth=%v|ver=%v|chain=%v|upbody=%s|ethbody=%s|verb=%s|chainb=%s", [ip, object.get(sig_up(ip), "status_code", 0), object.get(sig_up1(ip), "status_code", 0), object.get(sig_eth(ip), "status_code", 0), object.get(sig_ver(ip), "status_code", 0), object.get(sig_chain(ip), "status_code", 0), _short(object.get(sig_up(ip), "raw_body", "")), _short(object.get(sig_eth(ip), "raw_body", "")), _short(object.get(sig_ver(ip), "raw_body", "")), _short(object.get(sig_chain(ip), "raw_body", ""))])
 signer_lines := [signer_line(ip) | some ip in signer_ips]
 
 # ---------------- report / delivery ----------------
